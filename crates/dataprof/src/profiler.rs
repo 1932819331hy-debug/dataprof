@@ -345,9 +345,10 @@ impl Profiler {
     ///
     /// Intermediate events (such as [`ProgressEvent::ChunkProcessed`]) are best-effort
     /// and dropped if the channel is full rather than blocking profiling.
-    /// The terminal [`ProgressEvent::Finished`] event uses a slot reserved up front via
-    /// `try_reserve_owned()`, guaranteeing delivery without blocking even when the consumer
-    /// drains the channel only after profiling completes.
+    /// At the start of each run, `try_reserve_owned()` attempts to reserve a slot for the
+    /// terminal [`ProgressEvent::Finished`] event. If the reservation succeeds, `Finished`
+    /// is delivered without blocking even when the consumer drains the channel only after
+    /// profiling completes. If the channel is already full, `Finished` remains best-effort.
     #[cfg(feature = "async-streaming")]
     pub fn progress_channel(mut self, tx: tokio::sync::mpsc::Sender<ProgressEvent>) -> Self {
         self.progress_sink = ProgressSink::Channel(tx);
