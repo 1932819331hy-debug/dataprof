@@ -87,17 +87,35 @@ def _cell_to_str(value: object) -> str | None:
     return str(value)
 
 
-def _pandas_to_pyarrow_table(df: _Any, pyarrow: _Any) -> _Any:
-    """Convert a pandas DataFrame to a pyarrow Table, handling mixed object columns.
+def _pandas_row_column(name: str, col: _Any) -> _Column:
+    """Render one pandas column for row signatures, preserving container cells."""
+    values = list(col)
+    missing = list(col.isna()) if hasattr(col, "isna") else [False] * len(values)
+    cells: list[str | None] = []
+    containers: list[int] = []
+    for row, (is_missing, value) in enumerate(zip(missing, values)):
+        if is_missing:
+            cells.append(None)
+            continue
+        cells.append(_cell_to_str(value))
+        if _is_container(value):
+            containers.append(row)
+    return (name, cells, containers)
 
-    Fast path: delegates directly to ``pyarrow.Table.from_pandas(df)``.
-    Fallback path: for object and categorical columns whose values Arrow cannot
-    cast into a single type (e.g. numeric with placeholder text or mixed
-    booleans/dates), converts their cells via ``_cell_to_str`` into string arrays
-    so they can be profiled with ``type_homogeneity`` rather than aborting (#976).
+
+def _pandas_to_pyarrow_table_with_row_columns(
+    df: _Any, pyarrow: _Any
+) -> tuple[_Any, list[_Column] | None]:
+    """Convert pandas to Arrow and retain source row kinds when fallback needs them.
+
+    The second result is normally ``None``. It is populated only when the mixed
+    object fallback is required *and* one of the failing columns contained a
+    dict/list. Arrow must stringify that cell to make the column representable,
+    but a row signature must still distinguish the container from a string that
+    spells the same compact JSON (#982).
     """
     try:
-        return pyarrow.Table.from_pandas(df)
+        return pyarrow.Table.from_pandas(df), None
     except (pyarrow.ArrowInvalid, pyarrow.ArrowTypeError):
         # If columns have duplicate labels, pyarrow Table.from_pandas fails with
         # ValueError; duplicate column frames cannot be converted.
@@ -137,7 +155,7 @@ def _pandas_to_pyarrow_table(df: _Any, pyarrow: _Any) -> _Any:
                 ) from exc
 
         try:
-            return pyarrow.Table.from_pandas(df_fixed)
+            table = pyarrow.Table.from_pandas(df_fixed)
         except Exception as exc:
             for name in failing_cols:
                 try:
@@ -148,6 +166,37 @@ def _pandas_to_pyarrow_table(df: _Any, pyarrow: _Any) -> _Any:
                         f"{col_exc}"
                     ) from col_exc
             raise ValueError(f"pandas DataFrame conversion failed: {exc}") from exc
+
+        has_fallback_container = any(
+            _is_container(value) for name in failing_cols for value in df[name]
+        )
+        if not has_fallback_container:
+            return table, None
+
+        row_columns: list[_Column] = []
+        for i in range(len(df.columns)):
+            name = str(df.columns[i])
+            try:
+                row_columns.append(_pandas_row_column(name, df.iloc[:, i]))
+            except Exception as exc:
+                raise ValueError(
+                    f"pandas DataFrame: column {df.columns[i]!r} could not be converted "
+                    f"for row duplicate profiling: {exc}"
+                ) from exc
+        return table, row_columns
+
+
+def _pandas_to_pyarrow_table(df: _Any, pyarrow: _Any) -> _Any:
+    """Convert a pandas DataFrame to a pyarrow Table, handling mixed object columns.
+
+    Fast path: delegates directly to ``pyarrow.Table.from_pandas(df)``.
+    Fallback path: for object and categorical columns whose values Arrow cannot
+    cast into a single type (e.g. numeric with placeholder text or mixed
+    booleans/dates), converts their cells via ``_cell_to_str`` into string arrays
+    so they can be profiled with ``type_homogeneity`` rather than aborting (#976).
+    """
+    table, _ = _pandas_to_pyarrow_table_with_row_columns(df, pyarrow)
+    return table
 
 
 def _columns_from_dict(source: dict[_Any, _Any]) -> list[_Column]:
