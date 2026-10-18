@@ -33,8 +33,9 @@ use dataprof::{
     ExecutionMetadata, FileFormat, MetricPack, Profiler, TruncationReason,
 };
 use dataprof_parquet::record_batch_analyzer::RecordBatchAnalyzer;
-use dataprof_runtime::ReportAssembler;
+use dataprof_runtime::{ReportAssembler, RowSignature, RowUniquenessTracker};
 
+use super::columns::PyColumn;
 use super::config::PyProfilerConfig;
 
 /// PyCapsule name for Arrow schema (null-terminated for C compatibility)
@@ -263,7 +264,7 @@ impl PyRecordBatch {
     /// Convert to polars DataFrame (zero-copy).
     ///
     /// Requires polars to be installed. Polars natively supports the Arrow
-    /// PyCapsule protocol for efficient data transfer.
+    /// PyCapsule protocol for efficient zero-copy data transfer.
     fn to_polars<'py>(slf: &Bound<'py, Self>, py: Python<'py>) -> PyResult<Py<PyAny>> {
         let polars = py.import("polars").map_err(|_| {
             PyRuntimeError::new_err(
@@ -390,7 +391,8 @@ pub fn profile_dataframe(
     // path does: a chunked frame has more than one batch, and concatenating
     // them here would both allocate for rows the row limit is about to discard
     // and peak at roughly twice the input.
-    let batches = convert_dataframe_to_batches(py, &df, &source_library)?;
+    let (batches, mut pandas_row_columns) =
+        convert_dataframe_to_batches(py, &df, &source_library)?;
 
     // Optionally limit rows before analysis
     let (batches, truncated) = limit_batches(batches, effective_max_rows);
@@ -404,14 +406,29 @@ pub fn profile_dataframe(
         .column_indices(&available_columns)
         .map_err(|error| PyValueError::new_err(error.to_string()))?
     {
-        Some(indices) => batches
-            .into_iter()
-            .map(|batch| {
-                batch.project(&indices).map_err(|error| {
-                    PyRuntimeError::new_err(format!("Arrow projection failed: {error}"))
+        Some(indices) => {
+            if let Some(columns) = pandas_row_columns.take() {
+                if columns.len() != available_columns.len() {
+                    return Err(PyRuntimeError::new_err(
+                        "pandas fallback row provenance did not match the Arrow column count",
+                    ));
+                }
+                pandas_row_columns = Some(
+                    indices
+                        .iter()
+                        .map(|&index| columns[index].clone())
+                        .collect(),
+                );
+            }
+            batches
+                .into_iter()
+                .map(|batch| {
+                    batch.project(&indices).map_err(|error| {
+                        PyRuntimeError::new_err(format!("Arrow projection failed: {error}"))
+                    })
                 })
-            })
-            .collect::<PyResult<Vec<_>>>()?,
+                .collect::<PyResult<Vec<_>>>()?
+        }
         None => batches,
     };
 
@@ -435,6 +452,36 @@ pub fn profile_dataframe(
         analyzer.create_sample_columns()
     } else {
         HashMap::new()
+    };
+
+    // The #976 pandas fallback stringifies a failing mixed-object column so
+    // Arrow can represent it. If that column held a dict/list, the Arrow batch
+    // can no longer tell the container from a string spelling the same JSON.
+    // Rebuild only the row-duplicate signature from the original Python cell
+    // kinds; column profiles and completeness stay on the validated Arrow path.
+    let row_duplicates = match pandas_row_columns.as_deref() {
+        Some(columns) => {
+            let mut tracker = RowUniquenessTracker::default();
+            if !columns.is_empty() {
+                for row_index in 0..num_rows {
+                    let mut signature = RowSignature::default();
+                    for (_, cells, containers) in columns {
+                        let value = cells
+                            .get(row_index)
+                            .and_then(|cell| cell.as_deref())
+                            .unwrap_or("");
+                        if containers.binary_search(&row_index).is_ok() {
+                            signature.push_container_field(value);
+                        } else {
+                            signature.push_field(value);
+                        }
+                    }
+                    tracker.observe(signature.finish());
+                }
+            }
+            tracker.summary()
+        }
+        None => analyzer.row_duplicate_summary(),
     };
 
     let scan_time_ms = start.elapsed().as_millis();
@@ -463,7 +510,7 @@ pub fn profile_dataframe(
         exec,
     )
     .columns(column_profiles)
-    .with_row_duplicates(analyzer.row_duplicate_summary())
+    .with_row_duplicates(row_duplicates)
     .with_row_completeness(analyzer.row_completeness_summary())
     .with_analysis_options(&options);
 
@@ -913,18 +960,19 @@ fn limit_batches(batches: Vec<RecordBatch>, max_rows: Option<usize>) -> (Vec<Rec
 /// A frame carrying several Arrow chunks yields several batches. Both library
 /// paths below reach the same importer as a pyarrow Table does, because taking
 /// the first batch of a chunked frame reports on a prefix of the data without
-/// saying so.
+/// saying so. Pandas additionally returns source-row provenance only when its
+/// mixed-object fallback erased a container/scalar distinction.
 fn convert_dataframe_to_batches(
     py: Python<'_>,
     df: &Py<PyAny>,
     source_library: &DataFrameLibrary,
-) -> PyResult<Vec<RecordBatch>> {
+) -> PyResult<(Vec<RecordBatch>, Option<Vec<PyColumn>>)> {
     let bound = df.bind(py);
 
     match source_library {
         DataFrameLibrary::Pandas => convert_pandas_to_batches(py, bound),
-        DataFrameLibrary::Polars => convert_polars_to_batches(py, bound),
-        DataFrameLibrary::PyArrow => import_batches_from_pyarrow(py, bound),
+        DataFrameLibrary::Polars => Ok((convert_polars_to_batches(py, bound)?, None)),
+        DataFrameLibrary::PyArrow => Ok((import_batches_from_pyarrow(py, bound)?, None)),
         DataFrameLibrary::Custom(_) => {
             // The same importer as every other arm. A producer that carries its
             // batches the way a pyarrow Table does is walked in full here too:
@@ -932,7 +980,7 @@ fn convert_dataframe_to_batches(
             // first-batch-only read alive on the one path that has no library
             // to name in the error below.
             if bound.hasattr("__arrow_c_array__")? {
-                import_batches_from_pyarrow(py, bound)
+                Ok((import_batches_from_pyarrow(py, bound)?, None))
             } else {
                 Err(PyTypeError::new_err(format!(
                     "Unsupported DataFrame type: {}. Must implement Arrow PyCapsule protocol.",
@@ -947,20 +995,26 @@ fn convert_dataframe_to_batches(
 ///
 /// An Arrow-backed frame whose columns are chunked exports as several batches,
 /// which is why this returns the whole sequence rather than `to_batches()[0]`.
-fn convert_pandas_to_batches(py: Python<'_>, df: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+/// When #976's fallback had to stringify a container, the helper also returns
+/// row-aligned source text plus container indices for duplicate signatures.
+fn convert_pandas_to_batches(
+    py: Python<'_>,
+    df: &Bound<'_, PyAny>,
+) -> PyResult<(Vec<RecordBatch>, Option<Vec<PyColumn>>)> {
     let pyarrow = py.import("pyarrow").map_err(|_| {
         PyRuntimeError::new_err(
             "pyarrow required for pandas DataFrames. Install with: pip install pyarrow",
         )
     })?;
 
-    // Convert pandas to pyarrow Table, falling back to string arrays for mixed object columns (#976)
     let inputs_mod = py.import("dataprof._inputs")?;
-    let pa_table = inputs_mod
-        .getattr("_pandas_to_pyarrow_table")?
+    let converted = inputs_mod
+        .getattr("_pandas_to_pyarrow_table_with_row_columns")?
         .call1((df, &pyarrow))?;
+    let (pa_table, row_columns): (Py<PyAny>, Option<Vec<PyColumn>>) = converted.extract()?;
+    let batches = import_batches_from_pyarrow(py, pa_table.bind(py))?;
 
-    import_batches_from_pyarrow(py, &pa_table)
+    Ok((batches, row_columns))
 }
 
 /// Convert a polars DataFrame to its Arrow batches.
@@ -1142,9 +1196,8 @@ fn import_via_pycapsule(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Reco
     // Safety invariants:
     //  1. The pointers come from pyarrow PyCapsules and point to valid
     //     Arrow C Data Interface structs.
-    //  2. `from_raw()` takes ownership by nullifying the release callback at
-    //     the original pointer location. The returned struct now owns the
-    //     callback and will invoke it on Drop.
+    //  2. `from_raw()` takes ownership by nullifying release at the source pointer.
+    //     The returned struct now owns the callback and will invoke it on Drop.
     //  3. `from_ffi()` consumes `ffi_array` by value. On success, ownership
     //     moves into the returned ArrayData. On failure (Err), arrow-rs
     //     drops the consumed struct internally, calling the release callback.
