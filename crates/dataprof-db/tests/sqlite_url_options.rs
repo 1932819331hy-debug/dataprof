@@ -122,7 +122,7 @@ fn explicit_sqlite_mode_survives_unrelated_database_url() {
         .output()
         .expect("execute isolated default-configuration regression");
     assert!(
-        output.status.success(),
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
         "an unrelated DATABASE_URL must not hijack an explicit SQLite target:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
