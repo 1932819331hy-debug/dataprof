@@ -113,7 +113,11 @@ async fn sqlite_explicit_url_default_env_child() {
 fn explicit_sqlite_mode_survives_unrelated_database_url() {
     let executable = std::env::current_exe().expect("locate Rust test executable");
     let output = std::process::Command::new(executable)
-        .args(["--exact", "sqlite_explicit_url_default_env_child", "--nocapture"])
+        .args([
+            "--exact",
+            "sqlite_explicit_url_default_env_child",
+            "--nocapture",
+        ])
         .env("DATAPROF_SQLITE_ENV_CHILD", "1")
         .env(
             "DATABASE_URL",
