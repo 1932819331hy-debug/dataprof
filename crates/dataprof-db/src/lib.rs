@@ -144,7 +144,11 @@ fn apply_environment_configuration(
                 .apply_to_connection_string(config.connection_string.clone(), database_type);
         }
 
-        if config.load_credentials_from_env {
+        if config.load_credentials_from_env && database_type != "sqlite" {
+            // An explicit SQLite URI is a local file target, not a consumer of
+            // generic DATABASE_URL / DB_* credentials from other engines.
+            // Rebuilding it with foreign settings may replace its path or
+            // introduce unsupported user-info/host components (#912).
             let credentials = DatabaseCredentials::from_environment(database_type);
             config.connection_string =
                 credentials.apply_to_connection_string(&config.connection_string);
